@@ -1,6 +1,17 @@
-# ai_news_dashboard.py
+import os  # ← 最優先で環境変数を設定するために先に読み込む
+
+# ====== APIキーを“import ollama”の前に設定する（重要） ======
+DEFAULT_OLLAMA_API_KEY = "PUT_YOUR_OLLAMA_API"
+_env_key = (os.getenv("OLLAMA_API_KEY") or DEFAULT_OLLAMA_API_KEY).strip()
+# 非ASCII対策（念のため）
+try:
+    if any(ord(ch) > 127 for ch in _env_key):
+        _env_key = DEFAULT_OLLAMA_API_KEY
+except Exception:
+    pass
+os.environ["OLLAMA_API_KEY"] = _env_key  # ← ここで確実に設定してから ollama を import
+
 import streamlit as st
-import os
 import textwrap
 import time
 from typing import List, Dict, Optional, Tuple
@@ -56,297 +67,82 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================
-# 検索クライアント（fetchせず、検索結果だけ返す）
-# 1) ollama.Client.web_search が使えれば最優先
-# 2) OLLAMA_WEB_SEARCH_URL / OLLAMA_WEB_BASE_URL 経由のHTTP（失敗しても例外にしない）
-# 3) 無鍵フォールバック：Google News RSS / Bing News RSS（bs4/docduck不使用）
-# 4) さらに鍵があれば Serper / Brave / Bing API も利用可能（任意）
+# 検索クライアント（公式仕様準拠）
+# 1) REST:   POST https://ollama.com/api/web_search  Authorization: Bearer <OLLAMA_API_KEY>
+#    body:   {"query": "..."}
+# 2) Python: ollama.web_search(query)
 # ==============================
 class UniversalSearchClient:
     def __init__(self, api_key: Optional[str] = None, timeout: float = 30.0):
         self.api_key = (api_key or os.getenv("OLLAMA_API_KEY", "")).strip()
         self.timeout = timeout
 
-        # ---- Ollama SDK（web_search があれば使う）
-        self._sdk_client = None
-        self._has_sdk_search = False
-        try:
-            sdk_host = os.getenv("OLLAMA_HOST", "") or os.getenv("OLLAMA_WEB_BASE_URL", "")
-            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
-            self._sdk_client = ollama.Client(host=sdk_host.strip() or None, headers=headers)
-            self._has_sdk_search = hasattr(self._sdk_client, "web_search")
-        except Exception:
-            self._sdk_client = None
-            self._has_sdk_search = False
+        # 公式RESTの固定エンドポイント
+        self.fixed_search_url = (os.getenv("OLLAMA_WEB_SEARCH_URL", "")).strip() or "https://ollama.com/api/web_search"
 
-        # ---- HTTP直叩き用（Ollama系）
+        # HTTPセッション（Authorization: Bearer のみ）
         self.session = requests.Session()
         if self.api_key:
             self.session.headers.update({
                 "Authorization": f"Bearer {self.api_key}",
-                "Ollama-Api-Key": self.api_key,
-                "X-API-Key": self.api_key,
             })
         self.session.headers.update({
-            "Accept": "application/json,text/plain,*/*",
+            "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (compatible; AI-News-Dashboard/1.0)",
         })
 
-        self.fixed_search_url = (os.getenv("OLLAMA_WEB_SEARCH_URL", "")).strip() or None
-        base_env = (os.getenv("OLLAMA_WEB_BASE_URL", "") or os.getenv("OLLAMA_HOST", "")).strip()
-        self.base_candidates: List[str] = []
-        if base_env:
-            self.base_candidates.append(base_env.rstrip("/"))
-        self.base_candidates += [
-            "https://api.ollama.com",
-            "https://api.ollama.ai",
-            "https://cloud.ollama.com",
-            "http://localhost:11434",
-        ]
-        self.search_paths = [
-            "/web/search", "/api/web/search",
-            "/web_search", "/api/web_search",
-            "/search", "/api/search",
-            "/v1/web/search", "/api/v1/web/search",
-            "/v1/search", "/api/v1/search",
-        ]
-
-        # ---- 代替の外部検索API（任意）
-        self.serper_key = os.getenv("SERPER_API_KEY", "").strip()
-        self.brave_key  = os.getenv("BRAVE_API_KEY", "").strip()
-        self.bing_key   = os.getenv("BING_SUBSCRIPTION_KEY", "").strip()
-
-    # -------- 1) Ollama SDK --------
-    def _try_ollama_sdk(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        if not (self._sdk_client and self._has_sdk_search):
-            return None
-        try:
-            res = self._sdk_client.web_search(query, max_results=max_results)
-            # normalize
-            if hasattr(res, "results"):
-                out = []
-                for it in res.results:
-                    url = getattr(it, "url", "") or ""
-                    title = getattr(it, "title", "") or ""
-                    content = getattr(it, "content", "") or ""
-                    if url:
-                        out.append({"url": url, "title": title, "content": content})
-                return out
-            elif isinstance(res, dict) or isinstance(res, list):
-                return self._normalize_search(res)
-        except Exception:
-            return None
-        return None
-
-    # -------- 2) Ollama HTTP（失敗しても例外は投げない） --------
+    # -------- 1) 公式RESTエンドポイント（先に叩く：上限エラーを即検出） --------
     def _try_ollama_http(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        # 固定URL
-        if self.fixed_search_url:
-            r = self._http_search_once(self.fixed_search_url, query, max_results)
-            if r:
-                return r
-        # base x path
-        for b in self.base_candidates:
-            for p in self.search_paths:
-                url = f"{b.rstrip('/')}{p}"
-                r = self._http_search_once(url, query, max_results)
-                if r:
-                    return r
+        try:
+            resp = self.session.post(
+                self.fixed_search_url,
+                json={"query": query},
+                timeout=self.timeout
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                items = self._normalize_search(data)[:max_results]
+                if not items:
+                    st.info("[REST] 200 だが results が空。クエリ内容/対象期間の可能性。")
+                else:
+                    st.info(f"[REST] web_search OK: {len(items)} 件")
+                return items if items else None
+            else:
+                snippet = (resp.text or "")[:400].replace("\n"," ")
+                st.info(f"[REST] {resp.status_code} {self.fixed_search_url}  body={snippet}")
+                # 402/401/403/429 はここで打ち切る（SDKで二重に叩かない）
+                if resp.status_code in (401, 402, 403, 429):
+                    return None
+        except Exception as e:
+            st.info(f"[REST] 例外: {e}")
         return None
 
-    def _http_search_once(self, url: str, query: str, max_results: int) -> Optional[List[Dict]]:
-        # GET
-        for params in (
-            {"q": query, "k": max_results},
-            {"query": query, "k": max_results},
-            {"q": query, "limit": max_results},
-            {"query": query, "max_results": max_results},
-        ):
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {}
-                    items = self._normalize_search(data)
-                    if items:
-                        return items
-            except Exception:
-                pass
-        # POST
-        for payload in (
-            {"q": query, "k": max_results},
-            {"query": query, "k": max_results},
-            {"q": query, "limit": max_results},
-            {"query": query, "max_results": max_results},
-            {"q": query, "limit": max_results, "max_results": max_results},
-        ):
-            try:
-                resp = self.session.post(url, json=payload, timeout=self.timeout)
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {}
-                    items = self._normalize_search(data)
-                    if items:
-                        return items
-            except Exception:
-                pass
-        return None
-
-    # -------- 3) 無鍵RSS（確実に結果を返す） --------
-    def _try_google_news_rss(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        q = f"{query} when:7d"
-        q_enc = urllib.parse.quote_plus(q)
-        url = f"https://news.google.com/rss/search?q={q_enc}&hl=en-US&gl=US&ceid=US:en"
+    # -------- 2) Ollama Python SDK --------
+    def _try_ollama_sdk(self, query: str, max_results: int) -> Optional[List[Dict]]:
         try:
-            r = requests.get(url, timeout=self.timeout, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200 or not r.text:
-                return None
-            return self._parse_rss_items(r.text, max_results)
-        except Exception:
+            res = ollama.web_search(query)
+            items = self._normalize_search(res)[:max_results]
+            if not items:
+                st.info("[SDK] web_search は成功しましたが、results が空でした。")
+            else:
+                st.info(f"[SDK] web_search OK: {len(items)} 件")
+            return items if items else None
+        except Exception as e:
+            st.info(f"[SDK] web_search 例外: {e}")
             return None
 
-    def _try_bing_news_rss(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        q_enc = urllib.parse.quote_plus(query)
-        url = f"https://www.bing.com/news/search?q={q_enc}&format=rss"
-        try:
-            r = requests.get(url, timeout=self.timeout, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200 or not r.text:
-                return None
-            return self._parse_rss_items(r.text, max_results)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_rss_items(xml_text: str, max_results: int) -> List[Dict]:
-        items: List[Dict] = []
-        try:
-            root = ET.fromstring(xml_text)
-        except Exception:
-            return items
-        for it in root.findall(".//item"):
-            title = html.unescape(it.findtext("title") or "")
-            link = (it.findtext("link") or "").strip()
-            desc = html.unescape(it.findtext("description") or "")
-            if link:
-                items.append({"title": title, "url": link, "content": desc})
-            if len(items) >= max_results:
-                break
-        return items
-
-    # -------- 4) 追加の外部API（任意） --------
-    def _try_serper(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        if not self.serper_key:
-            return None
-        try:
-            url = "https://google.serper.dev/search"
-            headers = {"X-API-KEY": self.serper_key, "Content-Type": "application/json"}
-            payload = {"q": query, "num": max_results}
-            r = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            items = []
-            for it in data.get("organic", [])[:max_results]:
-                items.append({
-                    "title": it.get("title") or "",
-                    "url": it.get("link") or "",
-                    "content": it.get("snippet") or "",
-                })
-            if len(items) < max_results:
-                news_url = "https://google.serper.dev/news"
-                r2 = requests.post(news_url, headers=headers, json=payload, timeout=self.timeout)
-                if r2.status_code == 200:
-                    d2 = r2.json()
-                    for it in d2.get("news", []):
-                        if len(items) >= max_results:
-                            break
-                        items.append({
-                            "title": it.get("title") or "",
-                            "url": it.get("link") or "",
-                            "content": it.get("snippet") or "",
-                        })
-            return [x for x in items if x["url"]]
-        except Exception:
-            return None
-
-    def _try_brave(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        if not self.brave_key:
-            return None
-        try:
-            url = "https://api.search.brave.com/res/v1/web/search"
-            headers = {"X-Subscription-Token": self.brave_key, "Accept": "application/json"}
-            params = {"q": query, "count": max_results}
-            r = requests.get(url, headers=headers, params=params, timeout=self.timeout)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            items = []
-            for it in data.get("web", {}).get("results", [])[:max_results]:
-                items.append({
-                    "title": it.get("title") or "",
-                    "url": it.get("url") or "",
-                    "content": it.get("description") or "",
-                })
-            return [x for x in items if x["url"]]
-        except Exception:
-            return None
-
-    def _try_bing(self, query: str, max_results: int) -> Optional[List[Dict]]:
-        if not self.bing_key:
-            return None
-        try:
-            url = "https://api.bing.microsoft.com/v7.0/search"
-            headers = {"Ocp-Apim-Subscription-Key": self.bing_key}
-            params = {"q": query, "count": max_results, "responseFilter": "Webpages"}
-            r = requests.get(url, headers=headers, params=params, timeout=self.timeout)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            items = []
-            for it in data.get("webPages", {}).get("value", [])[:max_results]:
-                items.append({
-                    "title": it.get("name") or "",
-                    "url": it.get("url") or "",
-                    "content": it.get("snippet") or "",
-                })
-            return [x for x in items if x["url"]]
-        except Exception:
-            return None
-
-    # -------- 公開：検索 --------
+    # -------- 公開：検索（REST→SDK の順で試す） --------
     def search(self, query: str, max_results: int = 20) -> List[Dict]:
-        # 1) Ollama SDK
-        res = self._try_ollama_sdk(query, max_results)
-        if res:
-            return res[:max_results]
-
-        # 2) Ollama HTTP
         res = self._try_ollama_http(query, max_results)
         if res:
-            return res[:max_results]
-
-        # # 3) 無鍵RSS（まずGoogle News、ダメならBing News）
-        # res = self._try_google_news_rss(query, max_results)
-        # if res:
-        #     return res[:max_results]
-        # res = self._try_bing_news_rss(query, max_results)
-        # if res:
-        #     return res[:max_results]
-
-        # # 4) 任意の鍵があれば外部API
-        # for fn in (self._try_serper, self._try_brave, self._try_bing):
-        #     res = fn(query, max_results)
-        #     if res:
-        #         return res[:max_results]
-
-        # すべて失敗
+            return res
+        res = self._try_ollama_sdk(query, max_results)
+        if res:
+            return res
+        st.info("SDK/REST いずれも結果ゼロでした。APIキー・レート・ネットワークをご確認ください。")
         return []
 
-    # -------- 正規化 --------
+    # -------- 正規化（{"results":[...]} 想定） --------
     @staticmethod
     def _normalize_search(data) -> List[Dict]:
         if isinstance(data, list):
@@ -354,8 +150,6 @@ class UniversalSearchClient:
         elif isinstance(data, dict):
             if isinstance(data.get("results"), list):
                 items = data["results"]
-            elif isinstance(data.get("data"), list):
-                items = data["data"]
             else:
                 items = next((v for v in data.values() if isinstance(v, list)), [])
         else:
@@ -374,14 +168,14 @@ class UniversalSearchClient:
 # ==============================
 # 設定（APIキー）
 # ==============================
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip() or "ここにOllama apiを載せてください"
-os.environ["OLLAMA_API_KEY"] = OLLAMA_API_KEY
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()  # すでに先頭で設定済み
 
 # 検索クライアント（環境に応じて自動選択）
 search_client = UniversalSearchClient(api_key=OLLAMA_API_KEY)
 
 # ローカル LLM（gemma3:4b）
 try:
+    # 認証不要のローカル推論用クライアント
     ollama_local_client = ollama.Client()
 except Exception as e:
     st.error(f"Ollama ローカルクライアント初期化中にエラー: {e}")
@@ -394,7 +188,7 @@ except Exception as e:
 def web_search_and_fetch(query: str, max_results: int = 20) -> List[Dict]:
     """
     fetchは行わず、検索結果（title/url/snippet）だけを返す。
-    RSSフォールバックにより、鍵なしでも>0件を返すことを目標に実装。
+    公式の web_search 結果（title/url/content）を前提に整形。
     """
     results = search_client.search(query, max_results=max_results)
 
@@ -504,7 +298,7 @@ def analyze_ai_news_narrative(sources: List[Dict], selected_date: Optional[str])
 # UI（入力クエリだけメイン側の“でっかいチャット窓”に移動）
 # ==============================
 st.markdown('<div class="main-header">AI News Daily</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">最新のAIニュースを検索して、gemma3:4bで物語調に深掘り解説</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">最新のAIニュースを検索して、Ollamaで物語調に深掘り解説</div>', unsafe_allow_html=True)
 
 # --- 見出し直下に大きな入力窓を配置（アルゴリズムは変更しない） ---
 default_query = f"AI news artificial intelligence latest {datetime.now().strftime('%Y-%m-%d')}"
